@@ -4,16 +4,9 @@
 #     "gymnasium",
 #     "numpy",
 #     "pygame",
-#     "shimmy",
-#     "stable-baselines3",
-#     "torch",
+#     "tensorflow-cpu",
 #     "matplotlib"
 # ]
-# [tool.uv.sources]
-# torch = { index = "pytorch-cpu" }
-# [[tool.uv.index]]
-# name = "pytorch-cpu"
-# url = "https://download.pytorch.org/whl/cpu"
 # ///
 
 import gymnasium as gym
@@ -21,39 +14,37 @@ from gymnasium import spaces
 import numpy as np
 import pygame
 import random
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback
+import tensorflow as tf
+from collections import deque
 import matplotlib.pyplot as plt
 import sys
 import os
 
+# Potlačení TensorFlow logů (aby to nevypisovalo zbytečné info o GPU)
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 try:
     import nastaveni
 except ImportError:
-    print("CHYBA: Chybí soubor 'nastaveni.py'!")
-    sys.exit()
+    # Fallback pokud chybí soubor nastaveni.py
+    class NastaveniDefault:
+        PENALE_ZA_KROK = -0.1
+        PENALE_ZA_ZED = -10
+        PENALE_ZA_OCAS = -10
+        PENALE_ZA_HLAD = -5
+        MAX_KROKU_BEZ_JIDLA = 100
+        ODMENA_ZA_JIDLO = 10
+        CILOVY_POCET_JABLEK = 20
+        ODMENA_ZA_VYHRU = 50
+        RYCHLOST_HRY_NA_KONCI = 15
+        UKAZKA_KAZDYCH_N_HER = 50
+        CELKOVY_POCET_HER = 200
+    nastaveni = NastaveniDefault()
+    print("⚠️ UPOZORNĚNÍ: Soubor 'nastaveni.py' nebyl nalezen. Používám výchozí hodnoty.")
 
-# Globální proměnná pro rekord
+# Globální proměnné
 REKORD_JABLEK = 0
-NAZEV_MODELU = "muj_vytrenovany_had.zip"
-
-class SledovacHer(BaseCallback):
-    def __init__(self, limit_her_pro_kolo, verbose=0):
-        super(SledovacHer, self).__init__(verbose)
-        self.historie_jablek = []
-        self.limit_her = limit_her_pro_kolo
-        self.hry_v_tomto_kole = 0
-
-    def _on_step(self) -> bool:
-        if "dones" in self.locals and self.locals["dones"][0]:
-            self.hry_v_tomto_kole += 1
-            info = self.locals["infos"][0]
-            if "skore_na_konci" in info:
-                self.historie_jablek.append(info["skore_na_konci"])
-            
-            if self.hry_v_tomto_kole >= self.limit_her:
-                return False 
-        return True
+NAZEV_MODELU = "muj_vytrenovany_had_tf.keras" # Formát Keras
 
 class SnakeEnv(gym.Env):
     def __init__(self):
@@ -66,7 +57,6 @@ class SnakeEnv(gym.Env):
         self.clock = None
         self.pocet_jablek = 0 
         self.kroky_bez_jidla = 0
-        
         self.rezim_nekonecna = False 
         
     def reset(self, seed=None, options=None):
@@ -107,15 +97,17 @@ class SnakeEnv(gym.Env):
 
     def step(self, action):
         head = list(self.snake[0])
+        
+        # Ochrana proti otočení o 180 stupňů
         if (action == 0 and self.direction != 1): self.direction = 0
         elif (action == 1 and self.direction != 0): self.direction = 1
         elif (action == 2 and self.direction != 3): self.direction = 2
         elif (action == 3 and self.direction != 2): self.direction = 3
 
-        if self.direction == 0: head[1] -= 1
-        if self.direction == 1: head[1] += 1
-        if self.direction == 2: head[0] -= 1
-        if self.direction == 3: head[0] += 1
+        if self.direction == 0: head[1] -= 1 # Nahoru
+        if self.direction == 1: head[1] += 1 # Dolů
+        if self.direction == 2: head[0] -= 1 # Doleva
+        if self.direction == 3: head[0] += 1 # Doprava
         
         self.kroky_bez_jidla += 1
         game_over = False
@@ -163,171 +155,24 @@ class SnakeEnv(gym.Env):
             pygame.init()
             self.screen = pygame.display.set_mode((self.window_size, self.window_size))
             self.clock = pygame.time.Clock()
-            
-            if self.rezim_nekonecna:
-                pygame.display.set_caption("Snake AI - Režim diváka (Bez limitu)")
-            else:
-                pygame.display.set_caption("Snake AI - Trénink")
+            caption = "Snake AI (TensorFlow) - Divák" if self.rezim_nekonecna else "Snake AI (TensorFlow) - Trénink"
+            pygame.display.set_caption(caption)
             
         self.screen.fill((0, 0, 0))
         block_size = self.window_size // self.grid_size
+        
+        # Kreslení jídla
         pygame.draw.rect(self.screen, (255, 0, 0), (self.food[0]*block_size, self.food[1]*block_size, block_size, block_size))
+        
+        # Kreslení hada
         for i, segment in enumerate(self.snake):
             color = (0, 255, 0) if i > 0 else (150, 255, 150)
             pygame.draw.rect(self.screen, color, (segment[0]*block_size, segment[1]*block_size, block_size, block_size))
         
+        # Texty
         font = pygame.font.SysFont("Arial", 24)
-        
-        if self.rezim_nekonecna:
-            text_skore = font.render(f'Jablka: {self.pocet_jablek} (Nekonečno)', True, (255, 255, 255))
-        else:
-            text_skore = font.render(f'Jablka: {self.pocet_jablek}/{nastaveni.CILOVY_POCET_JABLEK}', True, (255, 255, 255))
-            
+        limit_text = "(Nekonečno)" if self.rezim_nekonecna else f"/{nastaveni.CILOVY_POCET_JABLEK}"
+        text_skore = font.render(f'Jablka: {self.pocet_jablek} {limit_text}', True, (255, 255, 255))
         text_rekord = font.render(f'REKORD: {REKORD_JABLEK}', True, (255, 215, 0))
-        color_hlad = (100, 100, 255) if self.kroky_bez_jidla < nastaveni.MAX_KROKU_BEZ_JIDLA * 0.8 else (255, 50, 50)
-        text_hlad = font.render(f'Hlad: {self.kroky_bez_jidla}/{nastaveni.MAX_KROKU_BEZ_JIDLA}', True, color_hlad)
-
-        self.screen.blit(text_skore, (10, 10))
-        self.screen.blit(text_rekord, (10, 40))
-        self.screen.blit(text_hlad, (10, 70))
-        pygame.display.flip()
-        self.clock.tick(nastaveni.RYCHLOST_HRY_NA_KONCI)
-
-    def close(self):
-        if self.screen is not None:
-            pygame.quit()
-            self.screen = None
-
-def vykreslit_graf(data):
-    try:
-        if not data: return
-        print("\n📊 Generuji graf...")
-        plt.figure(figsize=(10, 6))
-        plt.plot(data, label='Skóre', color='green', alpha=0.4)
-        window_size = 10
-        if len(data) > window_size:
-            avg_data = np.convolve(data, np.ones(window_size)/window_size, mode='valid')
-            plt.plot(range(window_size-1, len(data)), avg_data, label=f'Průměr', color='red', linewidth=2)
-        plt.axhline(y=nastaveni.CILOVY_POCET_JABLEK, color='blue', linestyle='--', label='Cíl')
-        plt.title('Vývoj inteligence hada')
-        plt.xlabel('Počet her')
-        plt.ylabel('Jablka')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-    except Exception as e:
-        print(f"Chyba grafu: {e}")
-
-def spustit_ukazku(env, model, cislo_hry):
-    print(f"\n🎥 UKÁZKA (po {cislo_hry} hrách)")
-    obs, _ = env.reset()
-    while True:
-        action, _ = model.predict(obs)
-        obs, reward, done, truncated, info = env.step(action)
-        env.render()
         
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                env.close(); return False 
-        
-        if done:
-            if info.get("vyhra", False):
-                print(f"\n🏆 VÍTĚZSTVÍ! Cíl splněn!")
-                print("---------------------------------------------")
-                volba = input("Co dál? (ENTER = Pokračovat v učení, S = Stop a Uložit): ").strip().lower()
-                print("---------------------------------------------")
-                if volba == 's':
-                    return True 
-            break
-    env.close()
-    return False
-
-if __name__ == "__main__":
-    env = SnakeEnv()
-    
-    print("\n" + "="*50)
-    print("🐍 SNAKE AI TRENER - STUDENT EDITION 🐍")
-    print("="*50)
-    print("1. Začít trénovat nového hada (od nuly)")
-    print("2. Nahrát uloženého hada")
-    volba_start = input("\nVyberte možnost (1 nebo 2): ").strip()
-    
-    model = None
-    rezim_jen_koukat = False 
-    
-    if volba_start == "2":
-        if os.path.exists(NAZEV_MODELU):
-            print(f"✅ Načítám mozek ze souboru: {NAZEV_MODELU}")
-            model = PPO.load(NAZEV_MODELU, env=env)
-            
-            print("\nCo chcete s načteným hadem dělat?")
-            print("   1 = Pokračovat v tréninku (zlepšovat ho)")
-            print("   2 = Jen se dívat (režim divák - nekonečná hra)")
-            podvolba = input("Vyberte (1/2): ").strip()
-            
-            if podvolba == '2':
-                rezim_jen_koukat = True
-                print("👀 Zapínám režim divák (Resetuji rekord, vypínám limity).")
-                # ZDE SE PŘEPÍNÁ REŽIM DIVÁKA
-                env.rezim_nekonecna = True
-                REKORD_JABLEK = 0 # Resetujeme rekord pro diváka
-            else:
-                print("💪 Jdeme dál trénovat!")
-                env.rezim_nekonecna = False
-        else:
-            print(f"❌ Soubor {NAZEV_MODELU} neexistuje! Začínám nový trénink.")
-            model = PPO("MlpPolicy", env, verbose=0)
-    
-    else:
-        print("👶 Vytvářím nového hada.")
-        model = PPO("MlpPolicy", env, verbose=0)
-        env.rezim_nekonecna = False
-
-    if not rezim_jen_koukat:
-        limit_her_kolo = getattr(nastaveni, 'UKAZKA_KAZDYCH_N_HER', 10)
-        cilove_hry = getattr(nastaveni, 'CELKOVY_POCET_HER', 100)
-        sledovac = SledovacHer(limit_her_pro_kolo=limit_her_kolo)
-        
-        odehrano_celkem = 0
-        ukoncit_trenink = False
-
-        print("\n🚀 START TRÉNINKU!")
-        
-        while odehrano_celkem < cilove_hry:
-            print(f"⚙️  Trénuji dalších {limit_her_kolo} her...")
-            sledovac.hry_v_tomto_kole = 0
-            model.learn(total_timesteps=1_000_000, callback=sledovac)
-            odehrano_celkem += sledovac.hry_v_tomto_kole
-            
-            print(f"   --> Celkem odehráno: {odehrano_celkem}")
-            
-            if spustit_ukazku(env, model, odehrano_celkem):
-                ukoncit_trenink = True
-                break
-
-        print("\n💾 Ukládám mozek hada...")
-        model.save(NAZEV_MODELU.replace(".zip", "")) 
-        print(f"✅ Uloženo do: {NAZEV_MODELU}")
-        
-        vykreslit_graf(sledovac.historie_jablek)
-        
-        print("\n🎬 Přepínám do nekonečného režimu pro ukázku...")
-        env.rezim_nekonecna = True
-
-    if rezim_jen_koukat:
-         print("\n🎬 Spouštím nekonečnou ukázku (žádný trénink)...")
-    
-    print("   (Zavřete okno křížkem pro úplný konec)")
-    
-    while True:
-        obs, _ = env.reset()
-        done = False
-        while not done:
-            action, _ = model.predict(obs)
-            obs, reward, done, truncated, info = env.step(action)
-            env.render()
-            
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    env.close()
-                    sys.exit()
+        self.screen.blit
