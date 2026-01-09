@@ -17,7 +17,7 @@ PENALE_ZA_HLAD = -10.0
 # 2. LIMITY A PRAVIDLA
 MAX_KROKU_BEZ_JIDLA = 100     # Smrt hlady
 
-CILOVY_POCET_JABLEK = 30      # Pokud sní tolik jablek, vyhrál a hra končí.
+CILOVY_POCET_JABLEK = 10      # Pokud sní tolik jablek, vyhrál a hra končí.
                         
 
 # ------------------------------------------
